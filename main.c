@@ -62,6 +62,16 @@
 #include "nrf_log_ctrl.h"
 #include "nrf_log_default_backends.h"
 
+/*author: steven 
+ANCHOR,TODO,NOTE,REVIEW,FIXME,STUB,SECTION
+NOTE , main ,
+date: 07 26- 15:47*/
+#include "peer_manager.h"
+#include "peer_manager_handler.h"
+#include "nrf_fstorage.h"
+#include "fds.h"
+#include "ble_conn_state.h"
+
 
 #define APP_BLE_CONN_CFG_TAG    1                                       /**< Tag that refers to the BLE stack configuration set with @ref sd_ble_cfg_set. The default tag is @ref BLE_CONN_CFG_TAG_DEFAULT. */
 #define APP_BLE_OBSERVER_PRIO   3                                       /**< BLE observer priority of the application. There is no need to modify this value. */
@@ -81,6 +91,17 @@ NRF_BLE_SCAN_DEF(m_scan);                                               /**< Sca
 
 static uint16_t m_ble_nus_max_data_len = BLE_GATT_ATT_MTU_DEFAULT - OPCODE_LENGTH - HANDLE_LENGTH; /**< Maximum length of data (in bytes) that can be transmitted to the peer by the Nordic UART service module. */
 
+/*author: steven 
+ANCHOR,TODO,NOTE,REVIEW,FIXME,STUB,SECTION
+TODO , main ,
+date: 07 26- 16:03*/
+static bool                  m_whitelist_disabled;        /**< True if whitelist has been temporarily disabled. */
+static void on_whitelist_req(void);
+static void whitelist_disable_and_scan(void);
+static void whitelist_load();
+static void peer_list_get(pm_peer_id_t * p_peers, uint32_t * p_size);
+static void bonded_client_add(pm_evt_t const * p_evt);
+static void delete_bonds(void);
 /**@brief NUS UUID. */
 static ble_uuid_t const m_nus_uuid =
 {
@@ -107,9 +128,11 @@ void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
 
 
 /**@brief Function for starting scanning. */
-static void scan_start(void)
+static void scan_start(bool isDel)
 {
     ret_code_t ret;
+    if(isDel)
+        delete_bonds();
 
     ret = nrf_ble_scan_start(&m_scan);
     APP_ERROR_CHECK(ret);
@@ -127,6 +150,11 @@ static void scan_evt_handler(scan_evt_t const * p_scan_evt)
 
     switch(p_scan_evt->scan_evt_id)
     {
+        case NRF_BLE_SCAN_EVT_WHITELIST_REQUEST:
+        {
+            on_whitelist_req();
+            m_whitelist_disabled = false;
+        } break;
          case NRF_BLE_SCAN_EVT_CONNECTING_ERROR:
          {
               err_code = p_scan_evt->params.connecting_err.err_code;
@@ -151,8 +179,12 @@ static void scan_evt_handler(scan_evt_t const * p_scan_evt)
          case NRF_BLE_SCAN_EVT_SCAN_TIMEOUT:
          {
              NRF_LOG_INFO("Scan timed out.");
-             scan_start();
+             scan_start(false);
          } break;
+        case NRF_BLE_SCAN_EVT_FILTER_MATCH:
+            break;
+        case NRF_BLE_SCAN_EVT_WHITELIST_ADV_REPORT:
+            break;
 
          default:
              break;
@@ -315,6 +347,12 @@ static void ble_nus_c_evt_handler(ble_nus_c_t * p_ble_nus_c, ble_nus_c_evt_t con
             err_code = ble_nus_c_handles_assign(p_ble_nus_c, p_ble_nus_evt->conn_handle, &p_ble_nus_evt->handles);
             APP_ERROR_CHECK(err_code);
 
+            err_code = pm_conn_secure(p_ble_nus_c->conn_handle, false);
+            if (err_code != NRF_ERROR_BUSY)
+            {
+                APP_ERROR_CHECK(err_code);
+            }
+
             err_code = ble_nus_c_tx_notif_enable(p_ble_nus_c);
             APP_ERROR_CHECK(err_code);
             NRF_LOG_INFO("Connected to device with Nordic UART Service.");
@@ -326,7 +364,7 @@ static void ble_nus_c_evt_handler(ble_nus_c_t * p_ble_nus_c, ble_nus_c_evt_t con
 
         case BLE_NUS_C_EVT_DISCONNECTED:
             NRF_LOG_INFO("Disconnected.");
-            scan_start();
+            scan_start(false);
             break;
     }
 }
@@ -385,6 +423,11 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
             // start discovery of services. The NUS Client waits for a discovery result
             err_code = ble_db_discovery_start(&m_db_disc, p_ble_evt->evt.gap_evt.conn_handle);
             APP_ERROR_CHECK(err_code);
+
+            if (ble_conn_state_central_conn_count() < NRF_SDH_BLE_CENTRAL_LINK_COUNT)
+            {
+                scan_start(false);
+            }
             break;
 
         case BLE_GAP_EVT_DISCONNECTED:
@@ -392,6 +435,11 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
             NRF_LOG_INFO("Disconnected. conn_handle: 0x%x, reason: 0x%x",
                          p_gap_evt->conn_handle,
                          p_gap_evt->params.disconnected.reason);
+
+            if (ble_conn_state_central_conn_count() < NRF_SDH_BLE_CENTRAL_LINK_COUNT)
+            {
+                scan_start(false);
+            }
             break;
 
         case BLE_GAP_EVT_TIMEOUT:
@@ -401,11 +449,11 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
             }
             break;
 
-        case BLE_GAP_EVT_SEC_PARAMS_REQUEST:
+        //case BLE_GAP_EVT_SEC_PARAMS_REQUEST:
             // Pairing not supported.
-            err_code = sd_ble_gap_sec_params_reply(p_ble_evt->evt.gap_evt.conn_handle, BLE_GAP_SEC_STATUS_PAIRING_NOT_SUPP, NULL, NULL);
-            APP_ERROR_CHECK(err_code);
-            break;
+            //err_code = sd_ble_gap_sec_params_reply(p_ble_evt->evt.gap_evt.conn_handle, BLE_GAP_SEC_STATUS_PAIRING_NOT_SUPP, NULL, NULL);
+            //APP_ERROR_CHECK(err_code);
+        //    break;
 
         case BLE_GAP_EVT_CONN_PARAM_UPDATE_REQUEST:
             // Accepting parameters requested by peer.
@@ -440,6 +488,26 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
             err_code = sd_ble_gap_disconnect(p_ble_evt->evt.gatts_evt.conn_handle,
                                              BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
             APP_ERROR_CHECK(err_code);
+            break;
+        case BLE_GAP_EVT_SEC_PARAMS_REQUEST:
+            NRF_LOG_DEBUG("BLE_GAP_EVT_SEC_PARAMS_REQUEST");
+            break;
+
+        case BLE_GAP_EVT_AUTH_KEY_REQUEST:
+            NRF_LOG_INFO("BLE_GAP_EVT_AUTH_KEY_REQUEST");
+            break;
+
+        case BLE_GAP_EVT_LESC_DHKEY_REQUEST:
+            NRF_LOG_INFO("BLE_GAP_EVT_LESC_DHKEY_REQUEST");
+            break;
+
+         case BLE_GAP_EVT_AUTH_STATUS:
+             NRF_LOG_INFO("BLE_GAP_EVT_AUTH_STATUS: status=0x%x bond=0x%x lv4: %d kdist_own:0x%x kdist_peer:0x%x",
+                          p_ble_evt->evt.gap_evt.params.auth_status.auth_status,
+                          p_ble_evt->evt.gap_evt.params.auth_status.bonded,
+                          p_ble_evt->evt.gap_evt.params.auth_status.sm1_levels.lv4,
+                          *((uint8_t *)&p_ble_evt->evt.gap_evt.params.auth_status.kdist_own),
+                          *((uint8_t *)&p_ble_evt->evt.gap_evt.params.auth_status.kdist_peer));
             break;
 
         default:
@@ -521,6 +589,9 @@ void bsp_event_handler(bsp_event_t event)
             {
                 APP_ERROR_CHECK(err_code);
             }
+            break;
+        case BSP_EVENT_WHITELIST_OFF:
+            whitelist_disable_and_scan();
             break;
 
         default:
@@ -615,8 +686,151 @@ static void db_discovery_init(void)
     ret_code_t err_code = ble_db_discovery_init(db_disc_handler);
     APP_ERROR_CHECK(err_code);
 }
+/**@brief Function for removing all bonded clients.
+ */
+inline static void bonded_client_remove_all(void)
+{
+    //memset(&m_bas_bonded_clients, 0, sizeof(m_bas_bonded_clients));
+}
+
+/**@brief Function for handling Peer Manager events.
+ *
+ * @param[in] p_evt  Peer Manager event.
+ */
+static void pm_evt_handler(pm_evt_t const * p_evt)
+{
+    pm_handler_on_pm_evt(p_evt);
+    pm_handler_disconnect_on_sec_failure(p_evt);
+    pm_handler_flash_clean(p_evt);
+
+    switch (p_evt->evt_id)
+    {
+        case PM_EVT_BONDED_PEER_CONNECTED:
+            bonded_client_add(p_evt);
+            //on_bonded_peer_reconnection_lvl_notify(p_evt);
+            break;
+
+        case PM_EVT_CONN_SEC_SUCCEEDED:
+            bonded_client_add(p_evt);
+            break;
+
+        case PM_EVT_PEERS_DELETE_SUCCEEDED:
+            bonded_client_remove_all();
+
+            // Bonds are deleted. Start scanning.
+            scan_start(false);
+            break;
+
+        default:
+            break;
+    }
+}
 
 
+/**@brief Function for adding a bonded client.
+ *
+ * @param[in] p_evt Pointer to peer manager event structure.
+ */
+static void bonded_client_add(pm_evt_t const * p_evt)
+{
+/*    uint16_t   conn_handle = p_evt->conn_handle;
+    uint16_t   peer_id     = p_evt->peer_id;
+    uint8_t  * p_counter   = &m_bas_bonded_clients.counter;
+
+    if (*p_counter == MAX_BAS_BONDED_CLIENT)
+    {
+        return;
+    }
+
+    for (uint8_t i = 0; i < *p_counter; i++)
+    {
+        // If the device is already on the list, update conn_handle.
+        if (m_bas_bonded_clients.devices[i].peer_id == peer_id)
+        {
+            m_bas_bonded_clients.devices[i].conn_handle = conn_handle;
+            return;
+        }
+    }
+
+    m_bas_bonded_clients.devices[*p_counter].conn_handle      = conn_handle;
+    m_bas_bonded_clients.devices[*p_counter].peer_id          = peer_id;
+    m_bas_bonded_clients.devices[*p_counter].last_battery_lvl = INVALID_BATTERY_LEVEL;
+
+    (*p_counter)++;
+    */
+}
+
+/**@brief Clear bond information from persistent storage.
+ */
+static void delete_bonds(void)
+{
+    ret_code_t err_code;
+
+    NRF_LOG_INFO("Erase bonds!");
+
+    err_code = pm_peers_delete();
+    APP_ERROR_CHECK(err_code);
+}
+static void on_whitelist_req(void)
+{
+    ret_code_t     err_code;
+
+    // Whitelist buffers.
+    ble_gap_addr_t whitelist_addrs[8];
+    ble_gap_irk_t  whitelist_irks[8];
+
+    memset(whitelist_addrs, 0x00, sizeof(whitelist_addrs));
+    memset(whitelist_irks,  0x00, sizeof(whitelist_irks));
+
+    uint32_t addr_cnt = (sizeof(whitelist_addrs) / sizeof(ble_gap_addr_t));
+    uint32_t irk_cnt  = (sizeof(whitelist_irks)  / sizeof(ble_gap_irk_t));
+
+    // Reload the whitelist and whitelist all peers.
+    whitelist_load();
+
+    // Get the whitelist previously set using pm_whitelist_set().
+    err_code = pm_whitelist_get(whitelist_addrs, &addr_cnt,
+                                whitelist_irks,  &irk_cnt);
+    APP_ERROR_CHECK(err_code);
+
+    if (((addr_cnt == 0) && (irk_cnt == 0)) ||
+        (m_whitelist_disabled))
+    {
+        // Don't use whitelist
+        err_code = nrf_ble_scan_params_set(&m_scan, NULL);
+        APP_ERROR_CHECK(err_code);
+        NRF_LOG_INFO("Starting scan.");
+    }
+    else
+    {
+        // Use whitelist.
+        NRF_LOG_INFO("Starting scan with whitelist.");
+    }
+
+}
+/**@brief Function for retrieving a list of peer manager peer IDs.
+ *
+ * @param[inout] p_peers   The buffer where to store the list of peer IDs.
+ * @param[inout] p_size    In: The size of the @p p_peers buffer.
+ *                         Out: The number of peers copied in the buffer.
+ */
+static void peer_list_get(pm_peer_id_t * p_peers, uint32_t * p_size)
+{
+    pm_peer_id_t peer_id;
+    uint32_t     peers_to_copy;
+
+    peers_to_copy = (*p_size < BLE_GAP_WHITELIST_ADDR_MAX_COUNT) ?
+                     *p_size : BLE_GAP_WHITELIST_ADDR_MAX_COUNT;
+
+    peer_id = pm_next_peer_id_get(PM_PEER_ID_INVALID);
+    *p_size = 0;
+
+    while ((peer_id != PM_PEER_ID_INVALID) && (peers_to_copy--))
+    {
+        p_peers[(*p_size)++] = peer_id;
+        peer_id = pm_next_peer_id_get(peer_id);
+    }
+}
 /**@brief Function for handling the idle state (main loop).
  *
  * @details Handles any pending log operations, then sleeps until the next event occurs.
@@ -629,6 +843,81 @@ static void idle_state_handle(void)
     }
 }
 
+static void whitelist_load()
+{
+    ret_code_t   ret;
+    pm_peer_id_t peers[8];
+    uint32_t     peer_cnt;
+
+    memset(peers, PM_PEER_ID_INVALID, sizeof(peers));
+    peer_cnt = (sizeof(peers) / sizeof(pm_peer_id_t));
+
+    // Load all peers from the flash and whitelist them.
+    peer_list_get(peers, &peer_cnt);
+
+    ret = pm_whitelist_set(peers, peer_cnt);
+    APP_ERROR_CHECK(ret);
+
+    // Set up the list of device identities.
+    // Some SoftDevices do not support this feature.
+    ret = pm_device_identities_list_set(peers, peer_cnt);
+    if (ret != NRF_ERROR_NOT_SUPPORTED)
+    {
+        APP_ERROR_CHECK(ret);
+    }
+}
+
+/**@brief Function for disabling the use of whitelist and starting scanning.
+ */
+static void whitelist_disable_and_scan(void)
+{
+    if (!m_whitelist_disabled)
+    {
+        NRF_LOG_INFO("Whitelist temporarily disabled.");
+        m_whitelist_disabled = true;
+    }
+
+    scan_start(false);
+}
+
+#define SEC_PARAM_BOND                  1                                       /**< Perform bonding. */
+#define SEC_PARAM_MITM                  0                                       /**< Man In The Middle protection not required. */
+#define SEC_PARAM_LESC                  0                                       /**< LE Secure Connections not enabled. */
+#define SEC_PARAM_KEYPRESS              0                                       /**< Keypress notifications not enabled. */
+#define SEC_PARAM_IO_CAPABILITIES       BLE_GAP_IO_CAPS_NONE                    /**< No I/O capabilities. */
+#define SEC_PARAM_OOB                   0                                       /**< Out Of Band data not available. */
+#define SEC_PARAM_MIN_KEY_SIZE          7                                       /**< Minimum encryption key size. */
+#define SEC_PARAM_MAX_KEY_SIZE          16                                      /**< Maximum encryption key size. */
+static void peer_manager_init(void)
+{
+    ble_gap_sec_params_t sec_param;
+    ret_code_t           err_code;
+
+    err_code = pm_init();
+    APP_ERROR_CHECK(err_code);
+
+    memset(&sec_param, 0, sizeof(ble_gap_sec_params_t));
+
+    // Security parameters to be used for all security procedures.
+    sec_param.bond           = SEC_PARAM_BOND;
+    sec_param.mitm           = SEC_PARAM_MITM;
+    sec_param.lesc           = SEC_PARAM_LESC;
+    sec_param.keypress       = SEC_PARAM_KEYPRESS;
+    sec_param.io_caps        = SEC_PARAM_IO_CAPABILITIES;
+    sec_param.oob            = SEC_PARAM_OOB;
+    sec_param.min_key_size   = SEC_PARAM_MIN_KEY_SIZE;
+    sec_param.max_key_size   = SEC_PARAM_MAX_KEY_SIZE;
+    sec_param.kdist_own.enc  = 1;
+    sec_param.kdist_own.id   = 1;
+    sec_param.kdist_peer.enc = 1;
+    sec_param.kdist_peer.id  = 1;
+
+    err_code = pm_sec_params_set(&sec_param);
+    APP_ERROR_CHECK(err_code);
+
+    err_code = pm_register(pm_evt_handler);
+    APP_ERROR_CHECK(err_code);
+}
 
 int main(void)
 {
@@ -641,13 +930,14 @@ int main(void)
     power_management_init();
     ble_stack_init();
     gatt_init();
+    peer_manager_init();
     nus_c_init();
     scan_init();
 
     // Start execution.
     printf("BLE UART central example started.\r\n");
     NRF_LOG_INFO("BLE UART central example started.");
-    scan_start();
+    scan_start(true);
 
     // Enter main loop.
     for (;;)
